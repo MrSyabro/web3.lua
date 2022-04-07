@@ -13,6 +13,7 @@ dependencies = {
    "dkjson",
    "luasec",
    "luasocket",
+   "lua-blockchain-crypto",
    -- If you depend on other rocks, add them here
 }
 build = {
