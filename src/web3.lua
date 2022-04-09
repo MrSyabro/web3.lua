@@ -19,6 +19,7 @@ local function fromhex(str)
 	end))
 end
 local function tobytes(num)
+  if num == 0 then return "" end
   local out = ""
   while num > 0xff do
     out = string.char(num & 0xff)..out
@@ -43,6 +44,7 @@ local function rpc_request(url, func, id, data)
 	if not response_json then return nil, err end
 
 	local response = json.decode(response_json)
+	if not response then return nil, "node error" end
 
 	if response.error then return nil, response.error.message end
 
@@ -168,7 +170,6 @@ local function contractABI(self, abi, address)
 	local client = self
 	local contract = {}
 	contract.address = address
-	contract.gas = 3000000
 
 	for k, i in ipairs(abi) do
 		if i.name then
@@ -183,71 +184,64 @@ local function contractABI(self, abi, address)
 			end
 
       if abi.type == "function" then
-      if abi.stateMutability == "nonpayable" then
-        local method = {abi.name}
-
-        if #abi.inputs > 0 then
-  				inputs_to_pack = {}
-  				for ik, input in ipairs(abi.inputs) do
-  					inputs_to_pack[ik] = input.type
-  				end
-  				method[2] = "("
-  				method[3] = table.concat(inputs_to_pack, ",")
-  				method[4] = ")"
-  			else
-  				method[2] = "()"
-        end
-			
-			  method = table.concat(method)
-			  local method_hash = crypto.sha3(method):sub(1, 5)
-			  
-			  contract[abi.name] = function (self, ...)
-			    local args = {...}
-			    local in_packed_data = data_pack(inputs_to_pack, args)
-			    local params = {
-						to = self.address,
-						from = "0x"..tohex(client.address),
-						data = "0x"..tohex(method_hash) .. (in_packed_data or ""),
-					}
-					
-					if client.nonce then params.nonce = client.nonce + 1 end
-					
-					local params_hash = crypto.keccak256(json.encode(params))
-					local signature = crypto.sign(fromhex(client:get_seckey()), params_hash)
-					signature = tohex(signature)
-					params.R = signature:sub(1, 32)
-					params.S = signature:sub(33, -1)
-					--params.V = fromhex(signature:sub(63, 64)) +24
-					
-					out_packed_data, err = client:eth_sendRawTransaction("0x"..tohex(json.encode(params)))
-			    if err then return nil, err end
-
-          if #outs_to_unpack > 0 then
-  				 out_data = data_unpack (outs_to_unpack, out_packed_data:sub(3, -1))
-  				 return out_data
-  				else
-  					return nil
-  				end
-			  end
-			elseif abi.stateMutability == "view" then
-        local method = abi.name.."()"
-				local method_hash = "0x"..tohex(crypto.sha3(method)):sub(1, 10)
-
-        contract[abi.name] = function(self)
-          local params = {
-  					to = self.address,
-  					data = method_hash
-  				}
-  				out_packed_data, err = client:eth_call(params, "latest")
-          if err then return nil, err end
-          
-          if #outs_to_unpack > 0 then
-    				local out_data = data_unpack (outs_to_unpack, out_packed_data:sub(3, -1))
-    				return out_data
-  				else
-  					return nil
-  				end
-        end
+        if abi.stateMutability == "nonpayable" then
+          local method = {abi.name}
+  
+          if #abi.inputs > 0 then
+            inputs_to_pack = {}
+    				for ik, input in ipairs(abi.inputs) do
+    					inputs_to_pack[ik] = input.type
+    				end
+    				method[2] = "("
+    				method[3] = table.concat(inputs_to_pack, ",")
+    				method[4] = ")"
+    			else
+    				method[2] = "()"
+          end
+  			
+  			  method = table.concat(method)
+  			  local method_hash = crypto.sha3(method):sub(1, 5)
+  			  
+  			  contract[abi.name] = function (self, ...)
+  			    local args = {...}
+  			    local in_packed_data = data_pack(inputs_to_pack, args)
+  			    local params = {
+  			      nonce = client.nonce,
+  			      gasPrice = 10^9,
+  						to = self.address,
+  						data = method_hash .. fromhex(in_packed_data or ""),
+  						chainId = client.cheidId,
+  					}
+  					
+  					local txhash, err = client:sendTransaction(params)
+  			    if err then return nil, err end
+  
+            if #outs_to_unpack > 0 then
+    				 out_data = data_unpack (outs_to_unpack, out_packed_data:sub(3, -1))
+    				 return out_data
+    				else
+    					return nil
+    				end
+  			  end
+  			elseif abi.stateMutability == "view" then
+          local method = abi.name.."()"
+  				local method_hash = "0x"..tohex(crypto.sha3(method)):sub(1, 10)
+  
+          contract[abi.name] = function(self)
+            local params = {
+    					to = self.address,
+    					data = method_hash
+    				}
+    				out_packed_data, err = client:eth_call(params, "latest")
+            if err then return nil, err end
+            
+            if #outs_to_unpack > 0 then
+      				local out_data = data_unpack (outs_to_unpack, out_packed_data:sub(3, -1))
+      				return out_data
+    				else
+    					return nil
+    				end
+          end
         end
       end
 		end
@@ -256,59 +250,104 @@ local function contractABI(self, abi, address)
 	return contract
 end
 
+local signers = setmetatable({
+  eip155 = 1,
+  eip1559 = 2,
+  function (seckey, tx)
+    tx[1] = tobytes(tx.nonce)
+    tx[2] = tobytes(tx.gasPrice)
+    tx[3] = tobytes(tx.gasLimit)
+    tx[4] = tx.to or ""
+    if type(tx.value) == "number" then
+      tx[5] = tobytes(tx.value or 0)
+    else tx[5] = tx.value end
+    tx[6] = tx.data or ""
+    tx[7] = tobytes(tx.chainId)
+    tx[8] = ""
+    tx[9] = ""
+    
+    local urtl_raw, err = crypto.serializeTx (tx)
+    if not urtl_raw then return nil, err end
+    local sign, recid = crypto.sign(seckey, crypto.sha3(urtl_raw))
+    
+    tx[7] = tobytes(recid + tx.chainId*2 + 35)
+    tx[8] = sign:sub(1, 32)
+    tx[9] = sign:sub(33, 64)
+    
+    local rtl_raw = crypto.serializeTx(tx)
+    return rtl_raw
+  end,
+  function (seckey, tx)
+    tx[1] = tobytes(tx.chainId)
+    tx[2] = tobytes(tx.nonce)
+    tx[3] = tobytes(tx.maxPriorityFee)
+    tx[4] = tobytes(tx.maxFee)
+    tx[5] = tobytes(tx.gasLimit)
+    tx[6] = tx.to or ""
+    if type(tx.value) == number then
+      tx[7] = tobytes(tx.value or 0)
+    else tx[7] = tx.value end
+    tx[8] = tx.data or ""
+    tx[9] = {}
+
+    local urtl_raw, err = crypto.serializeTx (tx)
+    if not urtl_raw then return nil, err end
+    local hash = crypto.sha3(string.char(0x2)..urtl_raw)
+    local sign, recid = crypto.sign(seckey, hash)
+    
+    tx[10] = tobytes(recid)
+    tx[11] = sign:sub(1, 32)
+    tx[12] = sign:sub(33, 64)
+    
+    local rtl_raw = crypto.serializeTx(tx)
+    return string.char(0x02)..rtl_raw
+  end,
+}, {__call = function(self, seckey, tx)
+  if tx.type and self[tx.type] then
+    return self[tx.type](seckey, tx)
+  else 
+    return nil, "unknown type"
+  end
+end})
+
 local function signTransaction(self, transaction)
   if not self.get_seckey then return end
   local seckey = self:get_seckey()
   if #seckey > 32 then 
     seckey = fromhex(seckey) -- convert to bytes array
   end
-
-  local urtl_raw, err = crypto.serializeTx (transaction)
-  if not urtl_raw then return nil, err end
-  local sign, recid = crypto.sign(seckey, crypto.sha3(urtl_raw))
   
-  transaction[7] = tobytes(recid + transaction.chainId*2 + 35)
-  transaction[8] = sign:sub(1, 32)
-  transaction[9] = sign:sub(33, 64)
-  
-  local rtl_raw = crypto.serializeTx(transaction)
+  local rtl_raw, err = signers(seckey, transaction)
+  if not rtl_raw then return nil, err end
   
   return rtl_raw
 end
 
 local function sendTransaction (self, tx)
-  if not tx.to
-  or not tx.value
-  then return nil, "bad argumet" end
-
-  if type(tx.nonce) == "number" then tx[1] = tobytes(tx.nonce)
-  else tx[1] = tx.nonce end
-  if type(tx.gasPrice) == "number" then tx[2] = tobytes(tx.gasPrice)
-  else tx[2] = tx.gasPrice end
-  if type(tx.gasLimit) == "number" then tx[3] = tobytes(tx.gasLimit)
-  else tx[3] = tx.gasLimit end
-  if type(tx.value) == "number" then tx[5] = tobytes(tx.value)
-  else tx[5] = tx.value end
-  if type(tx.chainId == "number") then tx[7] = tobytes(tx.chainId)
-  else tx[7] = tx.chainId end
-  tx[6] = tx.data
-  tx[4] = tx.to
-  tx[8] = ""
-  tx[9] = ""
+  if not tx.type
+  then return nil, "not foubd type" end
 
   local rtl_raw, err = signTransaction(self, tx)
   if err then print(err) end
   if not rtl_raw then return nil, "not signed" end
   
-  --return rtl_raw
+  --print("0x"..tohex(rtl_raw))
   return self:eth_sendRawTransaction("0x"..tohex(rtl_raw))
 end
 
 local function get_addr(self, seckey)
   if not seckey or not self.get_seckey then return end
-  --if self.address then return self.address end
   local pubkey = crypto.sec_to_pub(seckey or self:get_seckey()):sub (2, -1)
   return crypto.sha3(pubkey):sub(-20, -1)
+end
+
+local function gasstation(self)
+  local response_json, err = https.request (self.gasstation_uri)
+	if not response_json then return nil, err end
+
+	local response = json.decode(response_json)
+	
+	return response
 end
 
 local mt = {__index = mt_index}
@@ -323,6 +362,7 @@ function M.new(url, address)
 		signTransaction = signTransaction,
 		sendTransaction = sendTransaction,
 		get_addr = get_addr,
+		gasstation = gasstation,
 	}
 
 	return setmetatable(api, mt)
